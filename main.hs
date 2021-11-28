@@ -1,164 +1,166 @@
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE TupleSections #-}
+module Main where
 
-import Control.Applicative (Alternative (..), optional)
-import Control.Monad (replicateM)
-import Data.Bits (shiftL)
-import Data.Char (chr, digitToInt, isDigit, isHexDigit, isSpace, ord)
-import Data.Functor (($>))
-import Data.List (intercalate)
-import GHC.Generics (Generic)
-import Numeric (showHex)
+import Data.Char
+import Data.List
+import Control.Applicative
+import System.Environment
 
-data JValue
-  = JNull
-  | JBool Bool
-  | JString String
-  | JNumber {int :: Integer, frac :: [Int], exponent :: Integer}
-  | JArray [JValue]
-  | JObject [(String, JValue)]
-  deriving (Eq, Generic)
+data JsonValue
+  = JsonNull
+  | JsonBool Bool
+  | JsonNumber Integer
+  | JsonString String
+  | JsonArray [JsonValue]
+  | JsonObject [(String, JsonValue)]
+  deriving (Show, Eq)
 
-instance Show JValue where
-  show value = case value of
-    JNull -> "null"
-    JBool True -> "true"
-    JBool False -> "false"
-    JString s -> showJSONString s
-    JNumber s [] 0 -> show s
-    JNumber s f 0 -> show s ++ "." ++ concatMap show f
-    JNumber s [] e -> show s ++ "e" ++ show e
-    JNumber s f e -> show s ++ "." ++ concatMap show f ++ "e" ++ show e
-    JArray a -> "[" ++ intercalate ", " (map show a) ++ "]"
-    JObject o -> "{" ++ intercalate ", " (map showKV o) ++ "}"
-    where
-      showKV (k, v) = showJSONString k ++ ": " ++ show v
+-- Общий тип парсер, который возвращает объект JsonValue
+newtype Parser a = Parser
+  { runParser :: String -> Maybe (String, a)
+  }
 
-showJSONString :: String -> String
-showJSONString s = "\"" ++ concatMap showJSONChar s ++ "\""
+-- Вспомогательные методы и функции парсера
+instance Functor Parser where
+  fmap f (Parser p) =
+    Parser $ \input -> do
+      (input', x) <- p input
+      Just (input', f x)
 
-isControl :: Char -> Bool
-isControl c = c `elem` ['\0' .. '\31']
+instance Applicative Parser where
+  pure x = Parser $ \input -> Just (input, x)
+  (Parser p1) <*> (Parser p2) =
+    Parser $ \input -> do
+      (input', f) <- p1 input
+      (input'', a) <- p2 input'
+      Just (input'', f a)
 
-showJSONChar :: Char -> String
-showJSONChar c = case c of
-  '\'' -> "'"
-  '\"' -> "\\\""
-  '\\' -> "\\\\"
-  '/' -> "\\/"
-  '\b' -> "\\b"
-  '\f' -> "\\f"
-  '\n' -> "\\n"
-  '\r' -> "\\r"
-  '\t' -> "\\t"
-  _ | isControl c -> "\\u" ++ showJSONNonASCIIChar c
-  _ -> [c]
+instance Alternative Parser where
+  empty = Parser $ \_ -> Nothing
+  (Parser p1) <|> (Parser p2) =
+      Parser $ \input -> p1 input <|> p2 input
+
+charP :: Char -> Parser Char
+charP x = Parser f
   where
-    showJSONNonASCIIChar c =
-      let a = "0000" ++ showHex (ord c) "" in drop (length a - 4) a
+    f (y:ys)
+      | y == x = Just (ys, x)
+      | otherwise = Nothing
+    f [] = Nothing
 
-newtype Parser i o = Parser {runParser :: i -> Maybe (i, o)}
+stringP :: String -> Parser String
+stringP template = sequenceA $ map charP template
 
-satisfy :: (a -> Bool) -> Parser [a] a
-satisfy predicate = Parser $ \case
-  (x : xs) | predicate x -> Just (xs, x)
-  _ -> Nothing
+spanP :: (Char -> Bool) -> Parser String
+spanP f =
+  Parser $ \input ->
+    let (token, rest) = span f input
+     in Just (rest, token)
 
-char :: Char -> Parser String Char
-char c = satisfy (== c)
+notNull :: Parser [a] -> Parser [a]
+notNull (Parser p) =
+  Parser $ \input -> do
+    (input', xs) <- p input
+    if null xs
+      then Nothing
+      else Just (input', xs)
 
-instance Functor (Parser i) where
-  fmap f parser = Parser $ fmap (fmap f) . runParser parser
+-- Парсинг null
+jsonNull :: Parser JsonValue
+jsonNull = (\_ -> JsonNull) <$> stringP "null"
 
-digit :: Parser String Int
-digit = digitToInt <$> satisfy isDigit
+--Парсинг bool значений
+jsonBool :: Parser JsonValue
+jsonBool = f <$> (stringP "true" <|> stringP "false")
+   where f "true"  = JsonBool True
+         f "false" = JsonBool False
+         f _       = undefined
 
-instance Applicative (Parser i) where
-  pure x = Parser $ pure . (,x)
-  pf <*> po = Parser $ \input -> case runParser pf input of
-    Nothing -> Nothing
-    Just (rest, f) -> fmap f <$> runParser po rest
+--Парсинг number значений
+jsonNumber :: Parser JsonValue
+jsonNumber = f <$> notNull (spanP isDigit)
+    where f ds = JsonNumber $ read ds
 
-string :: String -> Parser String String
-string "" = pure ""
-string (c : cs) = (:) <$> char c <*> string cs
+-- Проверка на начало строки
+stringLiteral :: Parser String
+stringLiteral = charP '"' *> spanP (/= '"') <* charP '"'
 
-jNull :: Parser String JValue
-jNull = string "null" $> JNull
+-- Парсинг строки
+jsonString :: Parser JsonValue
+jsonString = JsonString <$> stringLiteral
 
-instance Alternative (Parser i) where
-  empty = Parser $ const empty
-  p1 <|> p2 = Parser $ \input -> runParser p1 input <|> runParser p2 input
+-- Проверка на пробельный символ
+ws :: Parser String
+ws = spanP isSpace
 
-instance Monad (Parser i) where
-  p >>= f = Parser $ \input -> case runParser p input of
-    Nothing -> Nothing
-    Just (rest, o) -> runParser (f o) rest
+-- Разделение элементов по символу
+sepBy :: Parser a -> Parser b -> Parser [b]
+sepBy sep element = (:) <$> element <*> many (sep *> element) <|> pure []
 
-jBool :: Parser String JValue
-jBool =
-  string "true" $> JBool True
-    <|> string "false" $> JBool False
-
-jsonChar :: Parser String Char
-jsonChar =
-  string "\\\"" $> '"'
-    <|> string "\\\\" $> '\\'
-    <|> string "\\/" $> '/'
-    <|> string "\\b" $> '\b'
-    <|> string "\\f" $> '\f'
-    <|> string "\\n" $> '\n'
-    <|> string "\\r" $> '\r'
-    <|> string "\\t" $> '\t'
-    <|> unicodeChar
-    <|> satisfy (\c -> not (c == '\"' || c == '\\' || isControl c))
+-- Парсинг массива
+jsonArray :: Parser JsonValue
+jsonArray = JsonArray <$> (charP '[' *> ws *>
+                           elements
+                           <* ws <* charP ']')
   where
-    unicodeChar =
-      chr . fromIntegral . digitsToNumber 16 0
-        <$> (string "\\u" *> replicateM 4 hexDigit)
+    elements = sepBy (ws *> charP ',' <* ws) jsonValue
 
-    hexDigit = digitToInt <$> satisfy isHexDigit
-
-digitsToNumber :: Int -> Integer -> [Int] -> Integer
-digitsToNumber base =
-  foldl (\num d -> num * fromIntegral base + fromIntegral d)
-
-highSurrogateLowerBound, highSurrogateUpperBound :: Int
-highSurrogateLowerBound = 0xD800
-highSurrogateUpperBound = 0xDBFF
-
-lowSurrogateLowerBound, lowSurrogateUpperBound :: Int
-lowSurrogateLowerBound = 0xDC00
-lowSurrogateUpperBound = 0xDFFF
-
-isHighSurrogate, isLowSurrogate, isSurrogate :: Char -> Bool
-isHighSurrogate a =
-  ord a >= highSurrogateLowerBound && ord a <= highSurrogateUpperBound
-isLowSurrogate a =
-  ord a >= lowSurrogateLowerBound && ord a <= lowSurrogateUpperBound
-isSurrogate a = isHighSurrogate a || isLowSurrogate a
-
-combineSurrogates :: Char -> Char -> Char
-combineSurrogates a b =
-  chr $
-    ((ord a - highSurrogateLowerBound) `shiftL` 10)
-      + (ord b - lowSurrogateLowerBound)
-      + 0x10000
-
-jString :: Parser String JValue
-jString = JString <$> (char '"' *> jString') -- 1
+-- Парсинг json объекта
+jsonObject :: Parser JsonValue
+jsonObject =
+  JsonObject <$> (charP '{' *> ws *> sepBy (ws *> charP ',' <* ws) pair <* ws <* charP '}')
   where
-    jString' = do
-      optFirst <- optional jsonChar -- 2
-      case optFirst of
-        Nothing -> "" <$ char '"' -- 3
-        Just first
-          | not (isSurrogate first) -> -- 4
-            (first :) <$> jString' -- 5
-        Just first -> do
-          -- 6
-          second <- jsonChar -- 7
-          if isHighSurrogate first && isLowSurrogate second -- 8
-            then (combineSurrogates first second :) <$> jString' -- 9
-            else empty -- 10
+    pair =
+      (\key _ value -> (key, value)) <$> stringLiteral <*>
+      (ws *> charP ':' <* ws) <*>
+      jsonValue
+
+-- общий парсер
+jsonValue :: Parser JsonValue
+jsonValue = jsonNull <|> jsonBool <|> jsonNumber <|> jsonString <|> jsonArray <|> jsonObject
+
+-- парсинг файла
+parseFile :: FilePath -> IO (Maybe JsonValue)
+parseFile fileName = do
+  input <- readFile fileName
+  return (snd <$> runParser jsonValue input)
+
+translateElementInArray :: JsonValue -> String -> String
+translateElementInArray value startString =
+  case value of
+    JsonObject ((fstKey, fstValue) : []) -> fstKey ++ ": " ++ (innerTranslateYaml fstValue startString)
+    JsonObject ((fstKey, fstValue) : xs) -> fstKey ++ ": " ++ (innerTranslateYaml fstValue startString) ++ "\n" ++ 
+      ((intercalate "\n" $ map (\(key, value) -> startString ++ "  " ++ key ++ ": " ++ (innerTranslateYaml value (startString ++ "    "))) xs))
+    _ -> translateToYaml value startString
+
+innerTranslateYaml :: JsonValue -> String -> String
+innerTranslateYaml value startString = 
+  case value of
+    JsonArray values -> "\n" ++ (intercalate "\n" $ map (\x -> startString ++ "- " ++ (translateElementInArray x startString)) values)
+    JsonObject values -> "\n" ++ (intercalate "\n" $ map (\(key, value) -> startString ++ key ++ ": " ++ (innerTranslateYaml value (startString ++ "  "))) values)
+    _ -> translateToYaml value startString
+
+-- перевод в yaml формат
+translateToYaml :: JsonValue -> String ->String
+translateToYaml value startString = 
+  case value of
+    JsonNull -> "null"
+    JsonNumber value -> show value
+    JsonBool value -> show value
+    JsonString value -> "\"" ++ value ++ "\""
+    JsonArray values -> intercalate "\n" $ map (\x -> startString ++ "- " ++ (innerTranslateYaml x (startString ++ "  "))) values
+    JsonObject values -> intercalate "\n" $ map (\(key, value) -> startString ++ key ++ ": " ++ (innerTranslateYaml value (startString ++ "  "))) values
+
+
+main :: IO ()
+main = do
+  args <- getArgs
+  case args of
+    [inputFile, outputFile] -> do
+      parseResult <- (parseFile inputFile)
+      case parseResult of
+        Just actualJsonAst -> do
+          writeFile outputFile $ translateToYaml actualJsonAst ""
+        Nothing -> do
+          putStrLn "ERROR"
+    
+    _ -> putStrLn "Invalid arguments"
